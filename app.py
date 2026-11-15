@@ -4,7 +4,7 @@ import os
 import re
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -74,6 +74,23 @@ def _product_from_row(row):
     return product
 
 
+def _order_from_row(row):
+    order = {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "product_id": row["product_id"],
+        "quantity": row["quantity"],
+        "unit_price": row["unit_price"],
+        "total_amount": row["total_amount"],
+        "status": row["status"],
+        "note": row["note"],
+        "createdAt": row["created_at"],
+    }
+    if row["updated_at"] is not None:
+        order["updatedAt"] = row["updated_at"]
+    return order
+
+
 class SQLiteStore:
     def __init__(self, database_path, legacy_dir):
         self.database_path = Path(database_path)
@@ -110,6 +127,22 @@ class SQLiteStore:
                         name TEXT NOT NULL,
                         price REAL NOT NULL,
                         quantity INTEGER NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS orders (
+                        id INTEGER PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        product_id INTEGER NOT NULL,
+                        quantity INTEGER NOT NULL,
+                        unit_price REAL NOT NULL,
+                        total_amount REAL NOT NULL,
+                        status TEXT NOT NULL,
+                        note TEXT,
                         created_at TEXT NOT NULL,
                         updated_at TEXT
                     )
@@ -325,6 +358,133 @@ class SQLiteStore:
                     "DELETE FROM products WHERE id = ?", (product_id,)
                 )
                 return _product_from_row(row)
+
+    def list_orders(
+        self, filters={}, sort_by="id", direction="ASC", limit=None, offset=0
+    ):
+        query = "SELECT * FROM orders"
+        if "status" in filters:
+            query += f" WHERE status = '{filters['status']}'"
+        query += f" ORDER BY {sort_by} {direction}"
+
+        connection = self._connect()
+        rows = connection.execute(query).fetchall()
+
+        orders = []
+        for row in rows:
+            order = _order_from_row(row)
+            user = self.get_user(order["user_id"])
+            product = self.get_product(order["product_id"])
+            order["user_name"] = user["name"] if user else None
+            order["product_name"] = product["name"] if product else None
+            orders.append(order)
+
+        if limit is not None:
+            orders = orders[offset : offset + limit]
+
+        connection.close()
+        return orders
+
+    def count_orders(self):
+        return len(self.list_orders())
+
+    def list_order_ids(self):
+        return [
+            {key: order[key] for key in ("id", "user_id", "product_id", "status")}
+            for order in self.list_orders()
+        ]
+
+    def get_order(self, order_id):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            return _order_from_row(row) if row is not None else None
+
+    def create_order(self, user_id, product_id, quantity, status, note):
+        created_at = _timestamp()
+        product = self.get_product(product_id)
+        unit_price = product["price"]
+        total_amount = unit_price * quantity
+
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO orders
+                        (user_id, product_id, quantity, unit_price,
+                         total_amount, status, note, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        product_id,
+                        quantity,
+                        unit_price,
+                        total_amount,
+                        status,
+                        note,
+                        created_at,
+                    ),
+                )
+                order_id = cursor.lastrowid
+
+        try:
+            self.update_product(
+                product_id, {"quantity": product["quantity"] - quantity}
+            )
+        except Exception:
+            pass
+
+        return {
+            "id": order_id,
+            "user_id": user_id,
+            "product_id": product_id,
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "total_amount": total_amount,
+            "status": status,
+            "note": note,
+            "createdAt": created_at,
+        }
+
+    def update_order(self, order_id, changes):
+        columns = {
+            "user_id": "user_id",
+            "product_id": "product_id",
+            "quantity": "quantity",
+            "status": "status",
+            "note": "note",
+        }
+        updates = [(columns[key], value) for key, value in changes.items()]
+        updates.append(("updated_at", _timestamp()))
+        assignments = ", ".join(f"{column} = ?" for column, _ in updates)
+        values = [value for _, value in updates]
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute(
+                    f"UPDATE orders SET {assignments} WHERE id = ?",
+                    (*values, order_id),
+                )
+                if cursor.rowcount == 0:
+                    return None
+                row = connection.execute(
+                    "SELECT * FROM orders WHERE id = ?", (order_id,)
+                ).fetchone()
+                return _order_from_row(row)
+
+    def delete_order(self, order_id):
+        connection = self._connect()
+        row = connection.execute(
+            "SELECT * FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return None
+        connection.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+        connection.commit()
+        connection.close()
+        return _order_from_row(row)
 
 
 def create_app(data_dir=None):
@@ -593,6 +753,139 @@ def create_app(data_dir=None):
         except sqlite3.Error:
             app.logger.exception("Failed to delete product data")
             return jsonify(error="Failed to delete product data"), 500
+
+    @app.post("/api/orders")
+    def add_order():
+        body = _payload()
+        user_id, product_id, quantity = (
+            body.get("user_id"),
+            body.get("product_id"),
+            body.get("quantity"),
+        )
+        status = body.get("status", "pending")
+        note = body.get("note")
+
+        if not user_id or not product_id or not quantity:
+            return jsonify(
+                error="Missing required fields: user_id, product_id, quantity"
+            ), 400
+        if status not in ["pending", "paid", "shipped", "cancelled"]:
+            return jsonify(
+                error="Status must be one of: pending, paid, shipped, cancelled"
+            ), 400
+
+        try:
+            order = store.create_order(
+                user_id, product_id, int(quantity), status, note
+            )
+            return jsonify(message="Order added successfully", data=order), 200
+        except sqlite3.Error:
+            app.logger.exception("Failed to save order data")
+            return jsonify(error="Failed to save order data"), 500
+
+    @app.get("/api/orders")
+    def get_orders():
+        status = request.args.get("status")
+        sort_by = request.args.get("sort", "id")
+        direction = request.args.get("direction", "ASC")
+        limit = request.args.get("limit")
+        offset = request.args.get("offset", 0)
+
+        filters = {}
+        if status:
+            filters["status"] = status
+
+        try:
+            orders = store.list_orders(
+                filters,
+                sort_by,
+                direction,
+                int(limit) if limit else None,
+                int(offset),
+            )
+            return jsonify(
+                message="Orders retrieved successfully",
+                count=store.count_orders(),
+                data=orders,
+            )
+        except sqlite3.Error:
+            app.logger.exception("Failed to read order data")
+            return jsonify(error="Failed to read order data"), 500
+
+    @app.get("/api/orders/ids")
+    def get_order_ids():
+        try:
+            orders = store.list_order_ids()
+            return jsonify(
+                message="Order IDs retrieved successfully",
+                count=len(orders),
+                data=orders,
+            )
+        except sqlite3.Error:
+            app.logger.exception("Failed to read order data")
+            return jsonify(error="Failed to read order data"), 500
+
+    @app.get("/api/orders/<order_id>")
+    def get_order(order_id):
+        order_id = int(order_id)
+        try:
+            order = store.get_order(order_id)
+            if order is None:
+                return jsonify(error=f"Order with ID {order_id} not found"), 404
+            return jsonify(message="Order retrieved successfully", data=order)
+        except sqlite3.Error:
+            app.logger.exception("Failed to read order data")
+            return jsonify(error="Failed to read order data"), 500
+
+    @app.put("/api/orders/<order_id>")
+    def update_order(order_id):
+        parsed_id = _parse_id(order_id)
+        if parsed_id is None:
+            return jsonify(error="ID must be an integer"), 400
+
+        body = _payload()
+        fields = ("user_id", "product_id", "quantity", "status", "note")
+        if all(key not in body for key in fields):
+            return jsonify(
+                error=(
+                    "Provide at least one field to update: "
+                    "user_id, product_id, quantity, status, note"
+                )
+            ), 400
+        if "status" in body and body["status"] not in [
+            "pending",
+            "paid",
+            "shipped",
+            "cancelled",
+        ]:
+            return jsonify(
+                error="Status must be one of: pending, paid, shipped, cancelled"
+            ), 400
+
+        changes = {key: value for key, value in body.items() if key != "id"}
+
+        try:
+            order = store.update_order(parsed_id, changes)
+            if order is None:
+                return jsonify(error=f"Order with ID {parsed_id} not found"), 404
+            return jsonify(message="Order updated successfully", data=order)
+        except sqlite3.Error:
+            app.logger.exception("Failed to update order data")
+            return jsonify(error="Failed to update order data"), 500
+
+    @app.delete("/api/orders/<order_id>")
+    def delete_order(order_id):
+        parsed_id = _parse_id(order_id)
+        if parsed_id is None:
+            return jsonify(error="ID must be an integer"), 400
+        try:
+            order = store.delete_order(parsed_id)
+            if order is None:
+                return jsonify(error=f"Order with ID {parsed_id} not found"), 404
+            return jsonify(message="Order deleted successfully", data=order)
+        except sqlite3.Error:
+            app.logger.exception("Failed to delete order data")
+            return jsonify(error="Failed to delete order data"), 500
 
     @app.get("/health")
     def health():

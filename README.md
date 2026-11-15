@@ -44,9 +44,17 @@ uv run python app.py
 | `GET` | `/api/products/:id` | Get a product |
 | `PUT` | `/api/products/:id` | Update a product's `name`, `price`, and/or `quantity` |
 | `DELETE` | `/api/products/:id` | Delete a product |
+| `POST` | `/api/orders` | Add an order (`user_id`, `product_id`, `quantity`, optional `status`, `note`) |
+| `GET` | `/api/orders` | List orders (`status`, `sort`, `direction`, `limit`, `offset` query params) |
+| `GET` | `/api/orders/ids` | List order IDs and key fields |
+| `GET` | `/api/orders/:id` | Get an order |
+| `PUT` | `/api/orders/:id` | Update an order's `user_id`, `product_id`, `quantity`, `status`, and/or `note` |
+| `DELETE` | `/api/orders/:id` | Delete an order |
 | `GET` | `/health` | Check server health |
 
 IDs must be integers. Missing records return `404`; invalid IDs or fields return `400`. Product prices must be non-negative numbers, and quantities must be non-negative integers.
+
+An order references a user and a product. `unit_price` and `total_amount` are captured from the product at creation time, and placing an order reduces the product's stock. Order `status` must be one of `pending`, `paid`, `shipped`, or `cancelled`; it defaults to `pending`.
 
 ## Database and migration
 
