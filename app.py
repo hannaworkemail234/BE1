@@ -362,13 +362,34 @@ class SQLiteStore:
     def list_orders(
         self, filters={}, sort_by="id", direction="ASC", limit=None, offset=0
     ):
+        allowed_sort_columns = {
+            "id",
+            "user_id",
+            "product_id",
+            "quantity",
+            "unit_price",
+            "total_amount",
+            "status",
+            "note",
+            "created_at",
+            "updated_at",
+        }
+        sort_by = str(sort_by).lower()
+        if sort_by not in allowed_sort_columns:
+            sort_by = "id"
+        direction = str(direction).upper()
+        if direction not in {"ASC", "DESC"}:
+            direction = "ASC"
+
         query = "SELECT * FROM orders"
+        parameters = []
         if "status" in filters:
-            query += f" WHERE status = '{filters['status']}'"
+            query += " WHERE status = ?"
+            parameters.append(filters["status"])
         query += f" ORDER BY {sort_by} {direction}"
 
         connection = self._connect()
-        rows = connection.execute(query).fetchall()
+        rows = connection.execute(query, parameters).fetchall()
 
         orders = []
         for row in rows:

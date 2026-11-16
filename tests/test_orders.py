@@ -67,6 +67,23 @@ class OrderApiTests(unittest.TestCase):
         self.assertEqual(len(page.get_json()["data"]), 1)
         self.assertEqual(page.get_json()["data"][0]["id"], 2)
 
+    def test_list_orders_validates_query_inputs(self):
+        self._create_order()
+        self._create_order(status="paid")
+
+        injected_status = self.client.get(
+            "/api/orders?status=%27%20OR%201%3D1%20--"
+        )
+        self.assertEqual(injected_status.get_json()["data"], [])
+
+        invalid_sort = self.client.get(
+            "/api/orders?sort=id%20DESC&direction=DESC%2C%20id"
+        )
+        self.assertEqual(
+            [order["id"] for order in invalid_sort.get_json()["data"]],
+            [1, 2],
+        )
+
     def test_order_ids_listing(self):
         self._create_order()
         ids = self.client.get("/api/orders/ids")
